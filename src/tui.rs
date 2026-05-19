@@ -339,7 +339,7 @@ impl App {
         } else if self.active_search.is_some() {
             "Searching descendants...".to_string()
         } else {
-            "space mark  a mark visible  u unmark all  d trash  p path  ? search  / filter  c clear filters  q quit"
+            "space mark  a mark visible  u unmark all  d trash  o reveal  p path  ? search  / filter  c clear  q quit"
                 .to_string()
         };
 
@@ -494,6 +494,10 @@ impl App {
                 self.stage_delete();
                 false
             }
+            KeyCode::Char('o') => {
+                self.open_targets_in_file_manager();
+                false
+            }
             KeyCode::Char('p') => {
                 self.showing_full_path = true;
                 false
@@ -626,26 +630,42 @@ impl App {
             return;
         }
 
-        let mut targets = self.selected_targets.values().cloned().collect::<Vec<_>>();
-        if targets.is_empty() {
-            targets = self.selected_target().into_iter().collect();
-        } else {
-            let root_paths = ops::root_paths(
-                targets
-                    .iter()
-                    .map(|target| target.path.clone())
-                    .collect::<Vec<_>>(),
-            )
-            .into_iter()
-            .collect::<HashSet<_>>();
-            targets.retain(|target| root_paths.contains(&target.path));
-        }
+        let targets = self.operation_targets();
 
         if targets.is_empty() {
             self.status = Some("Nothing selected".to_string());
         } else {
             self.pending_delete = Some(targets);
         }
+    }
+
+    fn open_targets_in_file_manager(&mut self) {
+        let targets = self.operation_targets();
+        if targets.is_empty() {
+            self.status = Some("Nothing selected".to_string());
+            return;
+        }
+
+        let mut opened = 0;
+        let mut first_error = None;
+        for target in &targets {
+            match ops::open_in_file_manager(&target.path) {
+                Ok(()) => opened += 1,
+                Err(err) if first_error.is_none() => {
+                    first_error = Some(format!("{}: {err}", target.path.display()));
+                }
+                Err(_) => {}
+            }
+        }
+
+        self.status = if let Some(error) = first_error {
+            Some(format!(
+                "Opened {opened}/{}; first error: {error}",
+                targets.len()
+            ))
+        } else {
+            Some(format!("Opened {opened} item(s) in file manager"))
+        };
     }
 
     fn confirm_delete(&mut self) {
@@ -782,6 +802,24 @@ impl App {
             .iter()
             .map(delete_target_for_visible_item)
             .collect()
+    }
+
+    fn operation_targets(&self) -> Vec<DeleteTarget> {
+        let mut targets = self.selected_targets.values().cloned().collect::<Vec<_>>();
+        if targets.is_empty() {
+            return self.selected_target().into_iter().collect();
+        }
+
+        let root_paths = ops::root_paths(
+            targets
+                .iter()
+                .map(|target| target.path.clone())
+                .collect::<Vec<_>>(),
+        )
+        .into_iter()
+        .collect::<HashSet<_>>();
+        targets.retain(|target| root_paths.contains(&target.path));
+        targets
     }
 
     fn visible_items(&self) -> Vec<VisibleItem> {

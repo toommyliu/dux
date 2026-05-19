@@ -63,6 +63,9 @@ struct Cli {
 enum Command {
     /// Delete a file or directory.
     Delete(DeleteArgs),
+
+    /// Open files or directories in the system file manager.
+    Open(OpenArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -80,6 +83,13 @@ struct DeleteArgs {
     yes: bool,
 }
 
+#[derive(Debug, Parser)]
+struct OpenArgs {
+    /// Files or directories to open in the system file manager.
+    #[arg(required = true)]
+    paths: Vec<PathBuf>,
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum SortArg {
     Size,
@@ -93,6 +103,7 @@ fn main() -> Result<()> {
     if let Some(command) = &cli.command {
         return match command {
             Command::Delete(args) => delete_path(args),
+            Command::Open(args) => open_paths(args),
         };
     }
 
@@ -109,6 +120,16 @@ fn main() -> Result<()> {
     } else {
         tui::run(root)?;
     }
+
+    Ok(())
+}
+
+fn open_paths(args: &OpenArgs) -> Result<()> {
+    for path in &args.paths {
+        ops::open_in_file_manager(path)?;
+    }
+
+    println!("Opened {} item(s) in file manager", args.paths.len());
 
     Ok(())
 }
