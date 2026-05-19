@@ -3,9 +3,10 @@ use std::{
     path::PathBuf,
 };
 
-use anyhow::Result;
-use clap::{Parser, ValueEnum};
+use anyhow::{Result, bail};
+use clap::{Parser, Subcommand, ValueEnum};
 
+mod ops;
 mod scan;
 mod tui;
 
@@ -17,6 +18,9 @@ use scan::{ScanReport, SizeMode, SortKey, flatten, human_size, scan, sorted_chil
     about = "Fast disk usage explorer for understanding what is taking space"
 )]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Path to scan.
     #[arg(default_value = ".")]
     path: PathBuf,
@@ -50,6 +54,27 @@ struct Cli {
     all: bool,
 }
 
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Delete a file or directory.
+    Delete(DeleteArgs),
+}
+
+#[derive(Debug, Parser)]
+struct DeleteArgs {
+    /// Files or directories to delete.
+    #[arg(required = true)]
+    paths: Vec<PathBuf>,
+
+    /// Delete permanently instead of moving to the OS trash.
+    #[arg(long)]
+    permanent: bool,
+
+    /// Confirm deletion without an interactive prompt.
+    #[arg(long, short)]
+    yes: bool,
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum SortArg {
     Size,
@@ -59,6 +84,13 @@ enum SortArg {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    if let Some(command) = &cli.command {
+        return match command {
+            Command::Delete(args) => delete_path(args),
+        };
+    }
+
     let root = scan(&cli.path, SizeMode::Physical);
 
     if cli.json {
@@ -72,6 +104,31 @@ fn main() -> Result<()> {
     } else {
         tui::run(root)?;
     }
+
+    Ok(())
+}
+
+fn delete_path(args: &DeleteArgs) -> Result<()> {
+    if !args.yes {
+        bail!("refusing to delete without --yes");
+    }
+
+    let paths = ops::root_paths(args.paths.clone());
+
+    for path in &paths {
+        if args.permanent {
+            ops::delete_permanently(path)?;
+        } else {
+            ops::trash_path(path)?;
+        }
+    }
+
+    let action = if args.permanent {
+        "Deleted permanently"
+    } else {
+        "Moved to trash"
+    };
+    println!("{action} {} item(s)", paths.len());
 
     Ok(())
 }
