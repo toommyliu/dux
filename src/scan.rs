@@ -75,6 +75,20 @@ pub fn flatten<'a>(node: &'a EntryNode, out: &mut Vec<&'a EntryNode>) {
     }
 }
 
+pub fn find_by_path<'a>(node: &'a EntryNode, path: &Path) -> Option<&'a EntryNode> {
+    if node.path == path {
+        return Some(node);
+    }
+
+    for child in &node.children {
+        if let Some(found) = find_by_path(child, path) {
+            return Some(found);
+        }
+    }
+
+    None
+}
+
 pub fn sorted_children<'a>(
     node: &'a EntryNode,
     sort: SortKey,

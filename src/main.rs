@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 mod ops;
 mod scan;
+mod search;
 mod tui;
 
 use scan::{ScanReport, SizeMode, SortKey, flatten, human_size, scan, sorted_children};
@@ -44,6 +45,10 @@ struct Cli {
     /// Only show paths matching this case-insensitive text.
     #[arg(long, short)]
     filter: Option<String>,
+
+    /// Fuzzy-search every descendant with fff-search.
+    #[arg(long)]
+    search: Option<String>,
 
     /// Maximum number of entries to print in list mode.
     #[arg(long, default_value_t = 40)]
@@ -152,7 +157,25 @@ fn print_list(root: &scan::EntryNode, cli: &Cli) {
     println!();
     println!("{:>10}  {:<7}  {}", "Size", "Kind", "Path");
 
-    if cli.all {
+    if let Some(query) = &cli.search {
+        match search::search_paths(&root.path, root, query, cli.limit) {
+            Ok(results) => {
+                for hit in results.hits {
+                    let Some(entry) = scan::find_by_path(root, &hit.path) else {
+                        continue;
+                    };
+
+                    println!(
+                        "{:>10}  {:<7}  {}",
+                        human_size(entry.size),
+                        format!("{:?}", entry.kind).to_lowercase(),
+                        entry.path.display()
+                    );
+                }
+            }
+            Err(err) => eprintln!("search failed: {err:#}"),
+        }
+    } else if cli.all {
         let mut entries = Vec::new();
         flatten(root, &mut entries);
         entries.remove(0);

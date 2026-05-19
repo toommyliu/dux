@@ -9,6 +9,7 @@ repository = "https://github.com/toommyliu/dux"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"
+fff-search = "0.8.1"
 ratatui = "0.29"
 rayon = "1"
 serde = { version = "1", features = ["derive"] }
