@@ -28,6 +28,7 @@ use ratatui::{
 use crate::{
     ops,
     scan::{EntryKind, EntryNode, SortKey, human_size, sorted_children},
+    scan::{ScanControl, SizeMode},
     search,
 };
 
@@ -70,6 +71,8 @@ struct App {
     cursor_by_path: HashMap<PathBuf, usize>,
     pending_delete: Option<Vec<DeleteTarget>>,
     active_delete: Option<Receiver<DeleteOutcome>>,
+    active_refresh: Option<Receiver<RefreshOutcome>>,
+    refresh_control: Option<ScanControl>,
     showing_full_path: bool,
     status: Option<String>,
     table_state: TableState,
@@ -123,6 +126,11 @@ struct DeleteOutcome {
     errors: Vec<String>,
 }
 
+struct RefreshOutcome {
+    indices: Vec<usize>,
+    result: Result<EntryNode, crate::scan::ScanCanceled>,
+}
+
 impl App {
     fn new(root: EntryNode) -> Self {
         let mut table_state = TableState::default();
@@ -144,6 +152,8 @@ impl App {
             cursor_by_path: HashMap::new(),
             pending_delete: None,
             active_delete: None,
+            active_refresh: None,
+            refresh_control: None,
             showing_full_path: false,
             status: None,
             table_state,
@@ -154,6 +164,7 @@ impl App {
         loop {
             self.poll_delete();
             self.poll_search();
+            self.poll_refresh();
             terminal.draw(|frame| self.draw(frame))?;
 
             if event::poll(Duration::from_millis(100))? {
@@ -336,10 +347,20 @@ impl App {
             format!("?{}", self.search_query)
         } else if self.filtering {
             format!("/{}", self.filter)
+        } else if self.active_refresh.is_some() {
+            let progress = self.refresh_control.as_ref().map(ScanControl::snapshot);
+            if let Some(progress) = progress {
+                format!(
+                    "Refreshing... {} scanned  {} files  {} dirs  {} errors  esc cancel",
+                    progress.scanned, progress.files, progress.dirs, progress.errors
+                )
+            } else {
+                "Refreshing... esc cancel".to_string()
+            }
         } else if self.active_search.is_some() {
             "Searching descendants...".to_string()
         } else {
-            "space mark  a mark visible  u unmark all  d trash  o reveal  p path  ? search  / filter  c clear  q quit"
+            "space mark  a mark visible  u unmark all  d trash  o reveal  p path  R refresh  ? search  / filter  c clear  q quit"
                 .to_string()
         };
 
@@ -348,13 +369,14 @@ impl App {
             lines.push(Line::from(status.clone()));
         }
 
+        let busy = self.active_delete.is_some()
+            || self.active_refresh.is_some()
+            || self.searching
+            || self.active_search.is_some()
+            || self.filtering;
         let style = if self.pending_delete.is_some() {
             Style::default().fg(Color::Red)
-        } else if self.active_delete.is_some() {
-            Style::default().fg(Color::Yellow)
-        } else if self.searching || self.active_search.is_some() {
-            Style::default().fg(Color::Yellow)
-        } else if self.filtering {
+        } else if busy {
             Style::default().fg(Color::Yellow)
         } else {
             Style::default().fg(Color::Gray)
@@ -377,7 +399,7 @@ impl App {
             .selected_item()
             .map(|item| item.path.display().to_string())
             .unwrap_or_else(|| self.current_node().path.display().to_string());
-        let width = area.width.saturating_sub(8).min(100).max(24);
+        let width = area.width.saturating_sub(8).clamp(24, 100);
         let height = ((path.chars().count() as u16 / width.max(1)) + 4)
             .min(area.height.saturating_sub(2))
             .max(5);
@@ -412,6 +434,20 @@ impl App {
                 KeyCode::Char('n') | KeyCode::Esc => {
                     self.pending_delete = None;
                     self.status = Some("Delete canceled".to_string());
+                }
+                _ => {}
+            }
+
+            return false;
+        }
+
+        if self.active_refresh.is_some() {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    if let Some(control) = &self.refresh_control {
+                        control.cancel();
+                    }
+                    self.status = Some("Canceling refresh...".to_string());
                 }
                 _ => {}
             }
@@ -496,6 +532,10 @@ impl App {
             }
             KeyCode::Char('o') => {
                 self.open_targets_in_file_manager();
+                false
+            }
+            KeyCode::Char('R') => {
+                self.start_refresh();
                 false
             }
             KeyCode::Char('p') => {
@@ -629,6 +669,10 @@ impl App {
             self.status = Some("A trash operation is already running".to_string());
             return;
         }
+        if self.active_refresh.is_some() {
+            self.status = Some("A refresh is already running".to_string());
+            return;
+        }
 
         let targets = self.operation_targets();
 
@@ -704,6 +748,36 @@ impl App {
         self.status = Some(format!("Moving {total} item(s) to trash..."));
     }
 
+    fn start_refresh(&mut self) {
+        if self.active_refresh.is_some() {
+            self.status = Some("A refresh is already running".to_string());
+            return;
+        }
+        if self.active_delete.is_some() {
+            self.status = Some("A trash operation is already running".to_string());
+            return;
+        }
+        if self.active_search.is_some() {
+            self.status = Some("A search is already running".to_string());
+            return;
+        }
+
+        let indices = self.path.clone();
+        let path = self.current_node().path.clone();
+        let control = ScanControl::new();
+        let worker_control = control.clone();
+        let (sender, receiver) = mpsc::channel();
+
+        thread::spawn(move || {
+            let result = crate::scan::scan_controlled(path, SizeMode::Physical, &worker_control);
+            let _ = sender.send(RefreshOutcome { indices, result });
+        });
+
+        self.active_refresh = Some(receiver);
+        self.refresh_control = Some(control);
+        self.status = Some("Refreshing current directory...".to_string());
+    }
+
     fn save_current_cursor(&mut self) {
         self.cursor_by_path
             .insert(self.current_node().path.clone(), self.selected);
@@ -760,6 +834,51 @@ impl App {
                 self.status = Some("Trash operation ended unexpectedly".to_string());
             }
         }
+    }
+
+    fn poll_refresh(&mut self) {
+        let Some(receiver) = self.active_refresh.take() else {
+            return;
+        };
+
+        match receiver.try_recv() {
+            Ok(outcome) => {
+                self.refresh_control = None;
+                self.apply_refresh_outcome(outcome);
+            }
+            Err(TryRecvError::Empty) => {
+                self.active_refresh = Some(receiver);
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.refresh_control = None;
+                self.status = Some("Refresh ended unexpectedly".to_string());
+            }
+        }
+    }
+
+    fn apply_refresh_outcome(&mut self, outcome: RefreshOutcome) {
+        let refreshed = match outcome.result {
+            Ok(refreshed) => refreshed,
+            Err(_) => {
+                self.status = Some("Refresh canceled".to_string());
+                return;
+            }
+        };
+
+        if !replace_node_at_indices(&mut self.root, &outcome.indices, refreshed) {
+            self.status = Some("Refresh target no longer exists".to_string());
+            return;
+        }
+
+        sanitize_indices(&self.root, &mut self.path);
+        let root = &self.root;
+        self.selected_targets
+            .retain(|path, _| crate::scan::find_by_path(root, path).is_some());
+        self.cursor_by_path
+            .retain(|path, _| crate::scan::find_by_path(root, path).is_some());
+        self.search_results = None;
+        self.restore_current_cursor();
+        self.status = Some("Refreshed current directory".to_string());
     }
 
     fn apply_delete_outcome(&mut self, outcome: DeleteOutcome) {
@@ -1003,13 +1122,12 @@ fn adjust_indices_after_removals(current: &[usize], removed: &[DeleteTarget]) ->
     for target in removed {
         if next.starts_with(&target.indices) {
             next.truncate(target.indices.len().saturating_sub(1));
-        } else if let Some((removed_index, removed_parent)) = target.indices.split_last() {
-            if removed_parent.len() < next.len()
-                && next.starts_with(removed_parent)
-                && *removed_index < next[removed_parent.len()]
-            {
-                next[removed_parent.len()] = next[removed_parent.len()].saturating_sub(1);
-            }
+        } else if let Some((removed_index, removed_parent)) = target.indices.split_last()
+            && removed_parent.len() < next.len()
+            && next.starts_with(removed_parent)
+            && *removed_index < next[removed_parent.len()]
+        {
+            next[removed_parent.len()] = next[removed_parent.len()].saturating_sub(1);
         }
     }
 
@@ -1029,6 +1147,35 @@ fn sanitize_indices(root: &EntryNode, indices: &mut Vec<usize>) {
     }
 
     indices.truncate(valid);
+}
+
+fn replace_node_at_indices(
+    root: &mut EntryNode,
+    indices: &[usize],
+    replacement: EntryNode,
+) -> bool {
+    if indices.is_empty() {
+        *root = replacement;
+        return true;
+    }
+
+    let Some((&last, parents)) = indices.split_last() else {
+        return false;
+    };
+    let mut node = root;
+
+    for index in parents {
+        let Some(child) = node.children.get_mut(*index) else {
+            return false;
+        };
+        node = child;
+    }
+
+    let Some(slot) = node.children.get_mut(last) else {
+        return false;
+    };
+    *slot = replacement;
+    true
 }
 
 fn remove_targets_from_tree(root: &mut EntryNode, targets: &[DeleteTarget]) {
@@ -1232,7 +1379,7 @@ mod tests {
             error_count: removed.1.error_count,
         };
 
-        remove_targets_from_tree(&mut root, &[removed_target.clone()]);
+        remove_targets_from_tree(&mut root, std::slice::from_ref(&removed_target));
 
         assert_eq!(root.file_count, 1);
         assert_eq!(root.size, original_size - removed_target.size);
@@ -1269,6 +1416,48 @@ mod tests {
 
         assert!(app.search_results.is_none());
         assert!(app.root.children.is_empty());
+    }
+
+    #[test]
+    fn refresh_replaces_scanned_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("one.txt"), b"one").unwrap();
+
+        let root = scan::scan(dir.path(), scan::SizeMode::Logical);
+        let mut app = App::new(root);
+        fs::write(dir.path().join("two.txt"), b"two").unwrap();
+        let refreshed = scan::scan(dir.path(), scan::SizeMode::Logical);
+
+        app.apply_refresh_outcome(RefreshOutcome {
+            indices: Vec::new(),
+            result: Ok(refreshed),
+        });
+
+        assert_eq!(app.root.file_count, 2);
+        assert!(
+            app.root
+                .children
+                .iter()
+                .any(|child| child.name == "two.txt")
+        );
+        assert_eq!(app.status.as_deref(), Some("Refreshed current directory"));
+    }
+
+    #[test]
+    fn canceled_refresh_keeps_existing_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("one.txt"), b"one").unwrap();
+
+        let root = scan::scan(dir.path(), scan::SizeMode::Logical);
+        let mut app = App::new(root);
+
+        app.apply_refresh_outcome(RefreshOutcome {
+            indices: Vec::new(),
+            result: Err(crate::scan::ScanCanceled),
+        });
+
+        assert_eq!(app.root.file_count, 1);
+        assert_eq!(app.status.as_deref(), Some("Refresh canceled"));
     }
 
     #[test]

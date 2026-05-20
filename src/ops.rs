@@ -28,7 +28,7 @@ pub fn open_in_file_manager(path: &Path) -> Result<()> {
         .is_dir();
     let invocation = file_manager_invocation(path, is_dir);
 
-    Command::new(&invocation.program)
+    Command::new(invocation.program)
         .args(&invocation.args)
         .spawn()
         .with_context(|| format!("failed to open {} in file manager", path.display()))?;
