@@ -69,6 +69,8 @@ struct App {
     active_search: Option<Receiver<SearchOutcome>>,
     selected_targets: HashMap<PathBuf, DeleteTarget>,
     cursor_by_path: HashMap<PathBuf, usize>,
+    back_paths: Vec<PathBuf>,
+    forward_paths: Vec<PathBuf>,
     pending_delete: Option<Vec<DeleteTarget>>,
     active_delete: Option<Receiver<DeleteOutcome>>,
     active_refresh: Option<Receiver<RefreshOutcome>>,
@@ -150,6 +152,8 @@ impl App {
             active_search: None,
             selected_targets: HashMap::new(),
             cursor_by_path: HashMap::new(),
+            back_paths: Vec::new(),
+            forward_paths: Vec::new(),
             pending_delete: None,
             active_delete: None,
             active_refresh: None,
@@ -360,7 +364,7 @@ impl App {
         } else if self.active_search.is_some() {
             "Searching descendants...".to_string()
         } else {
-            "space mark  a mark visible  u unmark all  d trash  o reveal  p path  R refresh  ? search  / filter  c clear  q quit"
+            "space mark  a mark visible  u unmark all  d trash  o reveal  p path  [ back  ] forward  R refresh  ? search  / filter  c clear  q quit"
                 .to_string()
         };
 
@@ -513,6 +517,14 @@ impl App {
                 self.open_parent();
                 false
             }
+            KeyCode::Char('[') => {
+                self.open_history_back();
+                false
+            }
+            KeyCode::Char(']') => {
+                self.open_history_forward();
+                false
+            }
             KeyCode::Char('/') => {
                 self.filtering = true;
                 false
@@ -647,21 +659,71 @@ impl App {
             return;
         };
 
-        self.save_current_cursor();
         if item.kind == EntryKind::Directory {
-            self.path = item.indices;
-            self.filter.clear();
-            self.search_results = None;
-            self.restore_current_cursor();
+            self.navigate_to_indices(item.indices, true);
         }
     }
 
     fn open_parent(&mut self) {
-        self.save_current_cursor();
-        if self.path.pop().is_some() {
-            self.filter.clear();
-            self.restore_current_cursor();
+        if !self.path.is_empty() {
+            let mut parent = self.path.clone();
+            parent.pop();
+            self.navigate_to_indices(parent, true);
         }
+    }
+
+    fn open_history_back(&mut self) {
+        self.open_history_item(true);
+    }
+
+    fn open_history_forward(&mut self) {
+        self.open_history_item(false);
+    }
+
+    fn open_history_item(&mut self, backwards: bool) {
+        while let Some(target) = if backwards {
+            self.back_paths.pop()
+        } else {
+            self.forward_paths.pop()
+        } {
+            let Some(indices) = find_indices_by_path(&self.root, &target) else {
+                continue;
+            };
+            let current_path = self.current_node().path.clone();
+            if backwards {
+                self.forward_paths.push(current_path);
+            } else {
+                self.back_paths.push(current_path);
+            }
+            self.navigate_to_indices(indices, false);
+            return;
+        }
+
+        self.status = Some(if backwards {
+            "No previous path".to_string()
+        } else {
+            "No forward path".to_string()
+        });
+    }
+
+    fn navigate_to_indices(&mut self, indices: Vec<usize>, record_history: bool) {
+        if self.path == indices {
+            return;
+        }
+
+        self.save_current_cursor();
+        if record_history {
+            let current_path = self.current_node().path.clone();
+            if self.back_paths.last() != Some(&current_path) {
+                self.back_paths.push(current_path);
+            }
+            self.forward_paths.clear();
+        }
+
+        self.path = indices;
+        self.filter.clear();
+        self.search_results = None;
+        self.restore_current_cursor();
     }
 
     fn stage_delete(&mut self) {
@@ -876,6 +938,10 @@ impl App {
             .retain(|path, _| crate::scan::find_by_path(root, path).is_some());
         self.cursor_by_path
             .retain(|path, _| crate::scan::find_by_path(root, path).is_some());
+        self.back_paths
+            .retain(|path| crate::scan::find_by_path(root, path).is_some());
+        self.forward_paths
+            .retain(|path| crate::scan::find_by_path(root, path).is_some());
         self.search_results = None;
         self.restore_current_cursor();
         self.status = Some("Refreshed current directory".to_string());
@@ -892,6 +958,18 @@ impl App {
                 .any(|removed| path == &removed.path || path.starts_with(&removed.path))
         });
         self.cursor_by_path.retain(|path, _| {
+            !outcome
+                .removed_targets
+                .iter()
+                .any(|removed| path == &removed.path || path.starts_with(&removed.path))
+        });
+        self.back_paths.retain(|path| {
+            !outcome
+                .removed_targets
+                .iter()
+                .any(|removed| path == &removed.path || path.starts_with(&removed.path))
+        });
+        self.forward_paths.retain(|path| {
             !outcome
                 .removed_targets
                 .iter()
@@ -1337,6 +1415,28 @@ mod tests {
         app.open_parent();
         assert_eq!(app.current_node().path, dir.path());
         assert_eq!(app.selected, 1);
+    }
+
+    #[test]
+    fn navigates_back_and_forward_through_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("alpha")).unwrap();
+
+        let root = scan::scan(dir.path(), scan::SizeMode::Logical);
+        let mut app = App::new(root);
+        app.sort = SortKey::Name;
+
+        app.open_selected();
+        assert_eq!(app.current_node().name, "alpha");
+
+        app.open_parent();
+        assert_eq!(app.current_node().path, dir.path());
+
+        app.open_history_back();
+        assert_eq!(app.current_node().name, "alpha");
+
+        app.open_history_forward();
+        assert_eq!(app.current_node().path, dir.path());
     }
 
     #[test]
